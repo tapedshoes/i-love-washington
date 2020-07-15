@@ -10,6 +10,7 @@ import os
 from subprocess import Popen, PIPE
 import numpy as np
 import re
+from tqdm import tqdm
 
 
 gdal_path = r'C:\Miniconda3\envs\hlz\Lib\site-packages\osgeo'
@@ -87,7 +88,8 @@ def landsat8b10_2_temp(b10_rad, k1, k2):
     
 def kelvin2farenheit(k):
     'Convert kelvin to farenheit'
-    return ( (k - 273.15) * (9 / 5) ) + 32 
+    k = (( (k - 273.15) * (9 / 5) ) + 32 ).astype(np.float32)
+    return k
 
 
 def kelvin2celcius(k):
@@ -134,22 +136,29 @@ def wrs2sqlite(sqlite):
     
 #     return wrs2_state
 
-def _find_first_cloudless(path, row, month):
+def _return_candidates(path, row, month, max_clouds=5, year_min=None, year_max=None):
 
-    # https://cloud.google.com/storage/docs/public-datasets/landsat
-    # https://googleapis.dev/python/storage/latest/buckets.html
+    '''
+    references:
+        https://cloud.google.com/storage/docs/public-datasets/landsat
+        https://googleapis.dev/python/storage/latest/buckets.html
+    '''
+    re_str = f'20\d\d{month:02d}\d\d'.format(month)
+
     
     # Filter the list of files to MTL.txt files for a specific path, row, and month
     list_mtl = sorted([
         b.name for b in bucket.list_blobs(prefix = 'LC08/01/{:03d}/{:03d}'.format(path, row)) # /[SENSOR_ID]/01/[PATH]/[ROW]/[SCENE_ID]/
         if 'T1' in b.name 
         and 'MTL.txt' in b.name
-        and re.search('20\d\d{:02d}\d\d'.format(month), b.name)], reverse=True) 
+        and re.search(re_str, b.name)], reverse=True) 
+    
+    
     
     mtl_md = {}
 
-    for mtl in list_mtl:
-        print(mtl)
+    for mtl in tqdm(list_mtl, desc=f'Examine MTLs for {row},{path}'):
+        
         mtl_txt = bucket.get_blob(mtl).download_as_string()
         metadata = dict([line.strip().split(' = ') for line in mtl_txt.decode().split('\n') if ' = ' in line])
         
@@ -157,23 +166,63 @@ def _find_first_cloudless(path, row, month):
         
         if not re.search('-{:02d}-'.format(month), metadata['DATE_ACQUIRED']):
             continue
-
-        mtl_md[mtl] = metadata
         
-        if metadata['CLOUD_COVER'] <= 1:
-            print('yep')
-            return metadata
-        else:
-            print('nope')
-            
-    print('Nothing with less than cloud cover 1, taking scene with the lowest cloud cover')
-    
-    sorted_by_clouds = sorted( mtl_md.items(), key=lambda k_v: k_v[1]['CLOUD_COVER'])
-    
-    return sorted_by_clouds[0][1]
+        if metadata['CLOUD_COVER'] <= max_clouds:
 
-def _pull_raster(metadata, band):
-    blob_name = f"LC08/01/{metadata['WRS_PATH']:0>3}/{metadata['WRS_ROW']:0>3}/{metadata['LANDSAT_PRODUCT_ID']}/{metadata['LANDSAT_PRODUCT_ID']}_B{band}.TIF"
-    tif_bytes = bucket.get_blob(blob_name).download_as_string()
+            mtl_md[mtl] = metadata
     
-    metadata['bytes'] = tif_bytes
+    
+    return mtl_md
+
+def _pull_raster(metadata, band, folder=None):
+    blob_name = f"LC08/01/{metadata['WRS_PATH']:0>3}/{metadata['WRS_ROW']:0>3}/{metadata['LANDSAT_PRODUCT_ID']}/{metadata['LANDSAT_PRODUCT_ID']}_B{band}.TIF"
+    blob = bucket.get_blob(blob_name)
+    
+    if not folder:
+        tif_bytes = blob.download_as_string()
+    
+        return  tif_bytes
+    else:
+        out_path = os.path.join(folder, blob_name.split('/')[-1])
+        blob.download_to_filename(out_path)
+        
+    
+def array2farenheit(array, metadata, nodata):
+    '''
+
+    Parameters
+    ----------
+    array : numpy.ndarray
+        Band 10 numpy array
+    metadata : dict
+        Dictionary with the required metadata
+    nodata : float
+        New nodata value to assign
+
+    Returns
+    -------
+    farenheit : numpy.ndarray
+        Array in temperature
+
+    '''
+
+    # Convert array to radiance
+    rad = landsat8_2_radiance(
+        band = array, 
+        a = metadata['RADIANCE_ADD_BAND_10'], 
+        m = eval(metadata['RADIANCE_MULT_BAND_10'])
+        )
+    
+    # Convert radiance to kelvin
+    kelvin = landsat8b10_2_temp(
+        b10_rad=rad, 
+        k1 = metadata['K1_CONSTANT_BAND_10'], 
+        k2 = metadata['K2_CONSTANT_BAND_10'])
+    
+    # Convert kelvin to farenheit
+    farenheit = kelvin2farenheit(kelvin)
+    
+    # Set low values to nodata
+    farenheit[farenheit < -100] = nodata
+    
+    return farenheit
